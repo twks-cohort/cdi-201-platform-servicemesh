@@ -1,0 +1,317 @@
+---
+version: 2.1
+
+orbs:
+  terraform: twdps/terraform@0.6.0
+  kube: twdps/kube-ops@0.2.0
+  op: twdps/onepassword@1.0.0
+  do: twdps/pipeline-events@0.1.0
+
+# ==== global pipeline parameters
+
+parameters:
+  context:
+    description: circleci context for all jobs
+    type: string
+    default: cohorts
+  terraform-version:
+    description: terraform version for all jobs
+    type: string
+    default: "1.2.2"
+  executor-image:
+    description: image to use for local jobs
+    type: string
+    default: twdps/circleci-kube-ops:alpine-stable
+
+# ==== triggers
+
+on-push-main: &on-push-main
+  branches:
+    only: /main/
+  tags:
+    ignore: /.*/
+
+on-tag-main: &on-tag-main
+  branches:
+    ignore: /.*/
+  tags:
+    only: /.*/
+
+commands:
+
+  set-environment:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+      source-env:
+        description: file to source to BASH_ENV
+        type: string
+    steps:
+      - op/env:
+          env-file: << parameters.source-env >>
+      - run:
+          name: write << parameters.cluster >>.auto.tfvars.json from template
+          command: op inject -i environments/<< parameters.cluster >>.auto.tfvars.json.tpl -o << parameters.cluster >>.auto.tfvars.json
+      - run:
+          name: set ~/.terraformrc
+          command: op inject -i tpl/terraformrc.tpl -o ~/.terraformrc
+      - run:
+          name: pull kubeconfig
+          command: |
+            mkdir -p ~/.kube
+            ENV=<< parameters.cluster >> op inject -i tpl/kubeconfig.tpl -o ~/.kube/config
+
+  deploy-servicemesh-components:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: deploy istio operator and matching version manifest
+          command: bash scripts/deploy_istio.sh << parameters.cluster >> inplace
+      - run:
+          name: deploy default cluster mtls namespace
+          command: kubectl apply -f tpl/lab-system-mtls-namespace.yaml
+
+  deploy-mesh-tools:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: deploy kiali
+          command: bash scripts/deploy_kiali.sh << parameters.cluster >>
+
+  validate-servicemesh-components:
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: $CLUSTER
+    steps:
+      - run:
+          name: validate istio deployment
+          command: CLUSTER=<< parameters.cluster >> bats test/validate_istio.bats
+      - run:
+          name: validate mesh tools
+          command: CLUSTER=<< parameters.cluster >> bats test/validate_mesh_tools.bats
+
+jobs:
+  deploy-servicemesh:
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: ""
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bach -eo pipefail
+      source-env:
+        description: env file to source to BASH_ENV
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - deploy-servicemesh-components:
+          cluster: << parameters.cluster >>
+      - deploy-mesh-tools:
+          cluster: << parameters.cluster >>
+      - validate-servicemesh-components:
+          cluster: << parameters.cluster >>
+
+  validate-servicemesh:
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    parameters:
+      cluster:
+        description: target kubernetes cluster
+        type: string
+        default: ""
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bach -eo pipefail
+      source-env:
+        description: env file to source to BASH_ENV
+        type: string
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - validate-servicemesh-components:
+          cluster: << parameters.cluster >>
+
+  # update multi-cluster dashboard. Only needs to deploy once for many envs.
+  update-dashboard:
+    parameters:
+      shell:
+        description: shell options
+        type: string
+        default: /bin/bash -eo pipefail
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: sandbox-us-east-2
+          source-env: op.nonprod.env
+      - run:
+          name: install requirements
+          command: pip install -r requirements.txt
+      - run:
+          name: update datadog eks-base dashboard
+          command: bash scripts/deploy_dashboard.sh
+
+  update-monitors:
+    parameters:
+      cluster:
+        description: cluster monitors to update
+        type: string
+      shell:
+        description: shell option directive
+        type: string
+        default: /bin/bash -eo pipefail
+      source-env:
+        description: .env file to source into BASH_ENV
+        type: string
+    docker:
+      - image: << pipeline.parameters.executor-image >>
+    shell: << parameters.shell >>
+    steps:
+      - checkout
+      - setup_remote_docker
+      - set-environment:
+          cluster: << parameters.cluster >>
+          source-env: << parameters.source-env >>
+      - run:
+          name: install requirements
+          command: pip install -r requirements.txt
+      - run:
+          name: update datadog cluster monitors
+          command: python scripts/deploy_monitors.py << parameters.cluster >> $(cat << parameters.cluster >>.auto.tfvars.json | jq -r .alert_channel)
+
+workflows:
+  version: 2
+
+  deploy servicemesh to sandbox-us-east-2:
+    jobs:
+      - terraform/apply:
+          name: deploy service account roles for sandbox-us-east-2 cluster
+          context: << pipeline.parameters.context >>
+          shell: op run --env-file=op.nonprod.env -- /bin/bash -eo pipefail
+          workspace: sandbox-us-east-2
+          before-terraform:
+            - set-environment:
+                cluster: sandbox-us-east-2
+                source-env: op.nonprod.env
+          filters: *on-push-main
+
+      - deploy-servicemesh:
+          name: deploy sandbox-us-east-2 servicemesh
+          context: << pipeline.parameters.context >>
+          shell: op run --env-file=op.nonprod.env -- /bin/bash -eo pipefail
+          source-env: op.nonprod.env
+          cluster: sandbox-us-east-2
+          requires:
+            - deploy service account roles for sandbox-us-east-2 cluster
+          filters: *on-push-main
+
+  release servicemesh to prod-us-east-1:
+    jobs:
+      - terraform/apply:
+          name: deploy service account roles for prod-us-east-1
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file=op.prod.env -- /bin/bash -eo pipefail
+          workspace: prod-us-east-1
+          before-terraform:
+            - set-environment:
+                cluster: prod-us-east-1
+                source-env: op.prod.env
+          filters: *on-tag-main
+
+      - deploy-servicemesh:
+          name: release prod-us-east-1 servicemesh
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file=op.prod.env -- /bin/bash -eo pipefail
+          source-env: op.prod.env
+          cluster: prod-us-east-1
+          requires:
+            - deploy service account roles for prod-us-east-1
+          filters: *on-tag-main
+
+  deploy servicemesh monitors:
+    jobs:
+      - update-monitors:
+          name: update sandbox-us-east-2 monitors
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.nonprod.env -- /bin/bash -eo pipefail
+          source-env: op.nonprod.env
+          cluster: sandbox-us-east-2
+          filters: *on-push-main
+
+      - approve prod-us-east-1 monitors release:
+          type: approval
+          requires:
+            - update sandbox-us-east-2 monitors
+          filters: *on-push-main
+
+      - update-monitors:
+          name: update prod-us-east-1 monitors
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.prod.env -- /bin/bash -eo pipefail
+          source-env: op.prod.env
+          cluster: prod-us-east-1
+          requires:
+            - approve prod-us-east-1 monitors release
+          filters: *on-push-main
+
+  deploy servicemesh dashboard:
+    jobs:
+      - update-dashboard:
+          name: update sandbox-us-east-2 dashboard
+          context: << pipeline.parameters.context >>
+          shell: op run --env-file=op.nonprod.env -- /bin/bash -eo pipefail
+          filters: *on-push-main
+
+  nightly-validation:
+    triggers:
+      - schedule:
+          cron: "0 0 * * *"
+          filters:
+            branches:
+              only:
+                - main
+    jobs:
+      - validate-servicemesh:
+          name: validate sandbox-us-east-2 servicemesh
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.nonprod.env -- /bin/bash -eo pipefail
+          source-env: op.nonprod.env
+          cluster: sandbox-us-east-2
+      - validate-servicemesh:
+          name: validate prod-us-east-1 servicemesh
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.prod.env -- /bin/bash -eo pipefail
+          source-env: op.prod.env
+          cluster: prod-us-east-1
+      - update-dashboard:
+          name: refresh eks-servicemesh dashboard
+          context: << pipeline.parameters.context >>
+          shell:  op run --env-file op.nonprod.env -- /bin/bash -eo pipefail
