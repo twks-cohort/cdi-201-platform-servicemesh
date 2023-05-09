@@ -54,9 +54,6 @@ commands:
           name: write << parameters.cluster >>.auto.tfvars.json from template
           command: op inject -i environments/<< parameters.cluster >>.auto.tfvars.json.tpl -o << parameters.cluster >>.auto.tfvars.json
       - run:
-          name: set ~/.terraformrc
-          command: op inject -i tpl/terraformrc.tpl -o ~/.terraformrc
-      - run:
           name: pull kubeconfig
           command: |
             mkdir -p ~/.kube
