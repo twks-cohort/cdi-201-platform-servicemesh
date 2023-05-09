@@ -1,4 +1,4 @@
 {
-  "cluster_name": "prod-us-east-1",
+  "cluster_name": "prod-us-east-2",
   "alert_channel": "prod"
 }
