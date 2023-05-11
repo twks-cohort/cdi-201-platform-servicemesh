@@ -13,3 +13,4 @@ istio-1*
 *.auto.tfvars.json
 sandbox.json
 kubeconfig
+istio-monitors/*.yaml
