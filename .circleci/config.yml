@@ -70,6 +70,9 @@ commands:
           name: deploy istio operator and matching version manifest
           command: bash scripts/deploy_istio.sh << parameters.cluster >> inplace
       - run:
+          name: deploy istio monitors
+          command: bash scripts/deploy_monitors.sh << parameters.cluster >>
+      - run:
           name: deploy default cluster mtls namespace
           command: kubectl apply -f tpl/lab-system-mtls-namespace.yaml
 
