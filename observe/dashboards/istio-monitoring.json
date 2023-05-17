@@ -303,11 +303,7 @@
     "refresh": "",
     "schemaVersion": 38,
     "style": "dark",
-    "tags": [
-        "PE-Team",
-        "Kubernetes",
-        "Istio"
-      ],
+    "tags": [],
     "templating": {
       "list": []
     },
